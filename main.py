@@ -2,30 +2,48 @@ import asyncio
 import logging
 import uuid
 import os
+import sys
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from aiohttp import web
 
-# Загрузка переменных окружения (из .env файла или системы)
+# Загрузка переменных окружения
 load_dotenv()
 
-# --- КОНФИГУРАЦИЯ ---
+# --- ЛОГИРОВАНИЕ ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- ПРОВЕРКА ОКРУЖЕНИЯ ---
+logger.info("Startup: Checking environment variables...")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+PORT = int(os.getenv("PORT", 8000))
 
-if not BOT_TOKEN or not SUPABASE_URL or not SUPABASE_KEY:
-    print("❌ ОШИБКА: Не найдены переменные окружения!")
-    print("Создайте файл .env или настройте Environment Variables в панели хостинга.")
-    exit(1)
+if not BOT_TOKEN:
+    logger.error("❌ FATAL: BOT_TOKEN is missing")
+    sys.exit(1)
+if not SUPABASE_URL:
+    logger.error("❌ FATAL: SUPABASE_URL is missing")
+    sys.exit(1)
+if not SUPABASE_KEY:
+    logger.error("❌ FATAL: SUPABASE_KEY is missing")
+    sys.exit(1)
 
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# --- ИНИЦИАЛИЗАЦИЯ ---
+try:
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    logger.info("✅ Supabase connected successfully")
+except Exception as e:
+    logger.error(f"❌ FATAL: Initialization failed: {e}")
+    sys.exit(1)
 
 CATEGORIES = {
   'roads': { 'name': 'Дороги', 'emoji': '🛣', 'subs': ['Яма на дороге', 'Стертая разметка', 'Отсутствует знак', 'Не работает светофор'], 'req_geo': True },
@@ -65,14 +83,14 @@ async def upload_photo(file_id: str) -> str:
         file_bytes = await bot.download_file(file_info.file_path)
         filename = f"{uuid.uuid4()}.jpg"
         supabase.storage.from_("evidence").upload(filename, file_bytes.read(), {"content-type": "image/jpeg"})
-        return supabase.storage.from_("evidence").get_public_url(filename)
+        return supabase.storage.from_("evidence").get_public_url(filename).public_url
     except Exception as e:
-        logging.error(f"Upload failed: {e}")
+        logger.error(f"Upload failed: {e}")
         return ""
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("Городской Помощник v0.8.7 готов.", reply_markup=get_main_menu())
+    await message.answer("Городской Помощник v0.8.8 готов.", reply_markup=get_main_menu())
 
 @dp.message(F.text == "📂 Мои заявки")
 async def cmd_my_complaints(message: types.Message):
@@ -168,6 +186,7 @@ async def process_phone(message: types.Message, state: FSMContext):
     await state.clear()
 
 async def check_operator_replies():
+    logger.info("ℹ️ Started operator reply loop")
     while True:
         try:
             res = supabase.table("ticket_messages").select("*, complaints(user_id)").eq("sender", "operator").eq("is_sent_to_telegram", False).execute()
@@ -178,11 +197,29 @@ async def check_operator_replies():
                     for url in msg['attachments']: await bot.send_photo(user_id, photo=url, caption=text); text=""
                 if text: await bot.send_message(user_id, text)
                 supabase.table("ticket_messages").update({"is_sent_to_telegram": True}).eq("id", msg['id']).execute()
-        except Exception as e: logging.error(f"Loop error: {e}")
+        except Exception as e: logger.error(f"Loop error: {e}")
         await asyncio.sleep(5)
 
+# --- WEB SERVER (HEALTH CHECK) ---
+async def health_check(request):
+    return web.Response(text="OK")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"🌍 Web server started on port {PORT}")
+
 async def main():
+    await start_web_server()
     asyncio.create_task(check_operator_replies())
     await dp.start_polling(bot)
 
-if __name__ == "__main__": asyncio.run(main())
+if __name__ == "__main__": 
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped!")
